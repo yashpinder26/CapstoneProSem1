@@ -10,7 +10,7 @@ import streamlit as st
 # ---------- CONFIG ----------
 st.set_page_config(page_title="Out-of-Pocket Costs Dashboard", layout="wide")
 
-DATA_DIR = "."
+DATA_DIR = "data"
 
 FILE_TABLE8 = "Table8_GP_Out_of_Pocket_Clean_YearFixed (1).csv"
 FILE_TABLE9 = "Table9_Remoteness_Out_of_Pocket_Clean (1) (1).csv"
@@ -499,5 +499,6 @@ elif page == "States & Territories":
 # ---------- footer ----------
 st.caption("Notes: “Actual” = prices in the year paid. “Inflation adjusted” = constant dollars to compare across years. "
            "Data sources: cleaned CSVs from AIHW MBS bulk-billing summary (Table 8 & 9), and state-wide file.")
+
 
 
