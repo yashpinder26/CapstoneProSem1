@@ -3,6 +3,7 @@ import os
 import re
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -10,7 +11,7 @@ import streamlit as st
 # ---------- CONFIG ----------
 st.set_page_config(page_title="Out-of-Pocket Costs Dashboard", layout="wide")
 
-DATA_DIR = "data"
+DATA_DIR = "."
 
 FILE_TABLE8 = "Table8_GP_Out_of_Pocket_Clean_YearFixed (1).csv"
 FILE_TABLE9 = "Table9_Remoteness_Out_of_Pocket_Clean (1) (1).csv"
@@ -83,11 +84,11 @@ def _template():
 
 # Consistent categorical palettes (fixed order)
 COLOR_SEIFA = {
-    "Q1": "#5DA5DA",  # blue
-    "Q2": "#60BD68",  # green
-    "Q3": "#F17CB0",  # pink
-    "Q4": "#B2912F",  # brown/gold
-    "Q5": "#F15854",  # red
+    "Q1": "#5DA5DA",
+    "Q2": "#60BD68",
+    "Q3": "#F17CB0",
+    "Q4": "#B2912F",
+    "Q5": "#F15854",
 }
 COLOR_AREA = {
     "Major Cities":  "#5DA5DA",
@@ -98,13 +99,10 @@ COLOR_AREA = {
 }
 
 def currency_axis():
-    # $ prefix + sensible ticks; clamp to zero for easier comparison
     return dict(title="", tickprefix="$", tickformat=",.2f", rangemode="tozero")
 
 def style_time_series(fig, title, subtitle=None):
-    fig.update_traces(mode="lines+markers",
-                      marker=dict(size=6, line=dict(width=0)),
-                      line=dict(width=2.2))
+    fig.update_traces(mode="lines+markers", marker=dict(size=6, line=dict(width=0)), line=dict(width=2.2))
     fig.update_layout(
         template=_template(),
         title=title,
@@ -115,10 +113,8 @@ def style_time_series(fig, title, subtitle=None):
         yaxis=currency_axis(),
         xaxis=dict(showgrid=True, gridcolor="rgba(128,128,128,0.15)"),
         yaxis_showgrid=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="left", x=0.0, title=None),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, title=None),
     )
-    # optional subtitle
     if subtitle:
         fig.add_annotation(
             x=0, y=1.08, xref="paper", yref="paper",
@@ -137,8 +133,7 @@ def style_bar(fig, title, subtitle=None):
         xaxis_title="Cost ($)",
         yaxis_title="",
         xaxis=dict(showgrid=True, gridcolor="rgba(128,128,128,0.15)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="left", x=0.0, title=None),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, title=None),
     )
     if subtitle:
         fig.add_annotation(
@@ -184,7 +179,6 @@ SEIFA = *Socio-Economic Indexes for Areas* (ABS). It ranks small areas in Austra
 **Why we show it:** to see if people in more disadvantaged areas pay more out-of-pocket (OOP) than people in advantaged areas.
 """
     )
-
 
 def remoteness_explainer():
     st.markdown(
@@ -268,7 +262,6 @@ year_max = int(pd.concat([t8["Year"], t9["Year"], st_wide["Year"]], ignore_index
 year_range = st.sidebar.slider("Year range", min_value=year_min, max_value=year_max,
                                value=(max(year_min, 2003), year_max), step=1)
 
-# 👇 changed wording: "Adjusted" -> "Inflation adjusted"
 basis = st.sidebar.radio(
     "Price basis",
     ["Actual", "Inflation adjusted"],
@@ -281,7 +274,106 @@ state_options = sorted(set(t8["State"].dropna().unique()).union(set(t9["State"].
 state_pick = st.sidebar.multiselect("State(s)/Territories", options=state_options, default=[])
 
 # ---------- page routing ----------
-page = st.sidebar.radio("Page", ["Overview", "SEIFA equity", "Remoteness", "States & Territories"])
+page = st.sidebar.radio("Page", ["Overview", "SEIFA equity", "Remoteness", "States & Territories", "Predictions"])
+
+# ---------- forecasting ----------
+def forecast_national(df: pd.DataFrame, basis: str, years: int = 5):
+    """
+    Returns (fig, forecast_df, actual_df)
+
+    forecast_df: Year, Value, Lower, Upper  (future rows only)
+    actual_df:   Year, Value                (history used for the model)
+    """
+    # pick value column (Actual / Inflation adjusted)
+    col_val = value_col_choice(df, basis)
+
+    # national mean per year (use Aus if available, else average states)
+    base = df.copy()
+    aus = base[base["State"].astype(str).str.fullmatch("Aus", case=False, na=False)]
+    if aus.empty:
+        series = base.groupby("Year", as_index=False)[col_val].mean()
+    else:
+        series = aus.groupby("Year", as_index=False)[col_val].mean()
+
+    series = series.dropna().sort_values("Year")
+    if series.empty:
+        raise ValueError("No national series available to forecast.")
+
+    ts = series.rename(columns={"Year": "ds", col_val: "y"}).copy()
+    ts["ds"] = pd.to_datetime(ts["ds"], format="%Y")
+
+    # --- try Prophet; fall back to linear regression
+    use_prophet = False
+    try:
+        from prophet import Prophet  # type: ignore
+        use_prophet = True
+    except Exception:
+        use_prophet = False
+
+    if use_prophet:
+        m = Prophet(interval_width=0.80, yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False)
+        m.fit(ts)
+        future = m.make_future_dataframe(periods=years, freq="Y")
+        fc = m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+    else:
+        from sklearn.linear_model import LinearRegression
+
+        X = np.arange(len(ts)).reshape(-1, 1)
+        y = ts["y"].values
+        model = LinearRegression().fit(X, y)
+
+        Xf = np.arange(len(ts) + years).reshape(-1, 1)
+        yhat = model.predict(Xf)
+
+        resid = y - model.predict(X)
+        s = float(np.std(resid)) if len(resid) else 0.0
+
+        h = np.arange(len(Xf)) - (len(ts) - 1)
+        h = np.clip(h, 0, None)
+        widen = np.sqrt(1 + h)
+        z = 1.28  # ~80%
+
+        dates = pd.date_range(ts["ds"].min(), periods=len(ts) + years, freq="Y")
+        fc = pd.DataFrame({
+            "ds": dates,
+            "yhat": yhat,
+            "yhat_lower": yhat - z * s * widen,
+            "yhat_upper": yhat + z * s * widen
+        })
+
+    # Split history vs future
+    cutoff = ts["ds"].max()
+    act = ts.copy()
+    act["Year"] = act["ds"].dt.year
+    act = act.rename(columns={"y": "Value"})[["Year", "Value"]]
+
+    pred = fc[fc["ds"] > cutoff].copy()
+    pred["Year"] = pred["ds"].dt.year
+    pred = pred.rename(columns={"yhat": "Value", "yhat_lower": "Lower", "yhat_upper": "Upper"})[
+        ["Year", "Value", "Lower", "Upper"]
+    ]
+
+    # Build figure
+    fig = px.line(act, x="Year", y="Value")
+    fig.update_traces(mode="lines", line=dict(width=3),
+                      hovertemplate="<b>%{x}</b><br>$%{y:.2f}<extra>Actual</extra>")
+    if not pred.empty:
+        fig.add_scatter(
+            x=pred["Year"], y=pred["Value"], mode="lines",
+            line=dict(width=3, dash="dash", color="#E45756"),
+            name="Forecast",
+            hovertemplate="<b>%{x}</b><br>$%{y:.2f}<extra>Forecast</extra>",
+        )
+        fig.add_scatter(
+            x=list(pred["Year"]) + list(pred["Year"][::-1]),
+            y=list(pred["Upper"]) + list(pred["Lower"][::-1]),
+            fill="toself", fillcolor="rgba(228,87,86,0.15)",
+            line=dict(width=0), hoverinfo="skip", name="80% interval"
+        )
+    fig = style_time_series(fig, f"National OOP forecast — {basis}",
+                            subtitle="Solid = actuals, dashed = forecast, band = ~80% interval")
+
+    return fig, pred, act
 
 # ---------- derive filtered frames ----------
 def filter_by_year(df):
@@ -334,15 +426,11 @@ if page == "Overview":
         c2.metric("Latest year", f"{latest_year}")
         c3.metric("Equity gap (Q5 − Q1)", f"${gap_latest:,.2f}" if pd.notna(gap_latest) else "N/A")
 
-        # --- National time series (polished) ---
         series = aus.sort_values("Year").reset_index(drop=True)
         fig = px.line(series, x="Year", y=col_val, markers=True)
-        fig.update_traces(
-            hovertemplate="<b>%{x}</b><br>$%{y:.2f} per GP service<br>(Price basis: " + basis + ")<extra></extra>"
-        )
+        fig.update_traces(hovertemplate="<b>%{x}</b><br>$%{y:.2f} per GP service<br>(Price basis: " + basis + ")<extra></extra>")
         fig = style_time_series(fig, f"Australia — OOP per service ({basis})")
 
-        # highlight latest year
         fig.add_scatter(
             x=[int(series['Year'].iloc[-1])],
             y=[float(series[col_val].iloc[-1])],
@@ -353,18 +441,14 @@ if page == "Overview":
         )
 
         st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "Each dot shows the average out-of-pocket (OOP) cost per GP service for that year on the selected price basis."
-        )
+        st.caption("Each dot shows the average out-of-pocket (OOP) cost per GP service for that year on the selected price basis.")
 
-    # --- Latest year bar by state/territory ---
     st.subheader("Latest-year OOP by state/territory")
     sw = filter_by_year(st_wide)
     if not sw.empty:
         ly = int(sw["Year"].max())
         latest = sw[sw["Year"] == ly].groupby("Region", as_index=False)["_actual_mean"].mean().sort_values("_actual_mean")
-        fig2 = px.bar(latest, x="_actual_mean", y="Region", orientation="h",
-                      labels={"_actual_mean":"Cost ($)", "Region":"State/Territory"})
+        fig2 = px.bar(latest, x="_actual_mean", y="Region", orientation="h", labels={"_actual_mean":"Cost ($)", "Region":"State/Territory"})
         fig2 = style_bar(fig2, f"OOP by state/territory — {ly} (Actual)")
         st.plotly_chart(fig2, use_container_width=True)
         st.caption("Bars show the mean OOP per GP service in each state/territory for the latest year.")
@@ -378,29 +462,14 @@ elif page == "SEIFA equity":
     st.markdown(
         """
 **What you’re seeing:**  
-• Out-of-pocket (OOP) cost per GP service by **SEIFA quintile** (Q1 = most disadvantaged, Q5 = least).  
+• OOP per service by **SEIFA quintile** (Q1 = most disadvantaged, Q5 = least).  
 • Optional state filter from the sidebar.  
 • Equity gap (Q5 − Q1) tracked over time.
-
-**What is SEIFA?**  
-SEIFA stands for **Socio-Economic Indexes for Areas**, created by the ABS (Australian Bureau of Statistics).  
-It ranks areas in Australia by levels of relative disadvantage:  
-- **Q1:** Most disadvantaged areas (lower income, higher unemployment, fewer resources)  
-- **Q5:** Least disadvantaged areas (higher income, better resources and opportunities)
-
-This lets us see whether people in more disadvantaged areas are paying more out-of-pocket compared to those in wealthier areas.
         """
     )
 
     df = order_seifa(apply_state_filter(filter_by_year(t8)))
     col_val = value_col_choice(t8, basis)
-    fig = px.line(
-        df.sort_values(["SEIFA","Year"]),
-        x="Year", y=col_val, color="SEIFA", line_group="SEIFA",
-        color_discrete_map=COLOR_SEIFA,
-        category_orders={"SEIFA": SEIFA_ORDER},
-)
-
 
     if df.empty:
         st.info("No rows for current filters.")
@@ -411,7 +480,6 @@ This lets us see whether people in more disadvantaged areas are paying more out-
         st.plotly_chart(fig, use_container_width=True)
         st.caption("Each dot is the yearly average OOP per GP service for that SEIFA quintile.")
 
-        # Gap (Q5 - Q1)
         pvt = df.pivot_table(index="Year", columns="SEIFA", values=col_val, aggfunc="mean")
         if set(["Q1","Q5"]).issubset(pvt.columns):
             pvt["Gap_Q5_minus_Q1"] = pvt["Q5"] - pvt["Q1"]
@@ -424,18 +492,11 @@ This lets us see whether people in more disadvantaged areas are paying more out-
         else:
             st.info("Need both Q1 and Q5 to compute gap.")
 
-
 # ---------- Remoteness ----------
 elif page == "Remoteness":
     st.title("Remoteness")
     remoteness_explainer()
-    st.markdown(
-        """
-**What you’re seeing:**  
-• OOP per service by remoteness area (Major Cities → Very Remote) over time.  
-• Latest-year comparison of remoteness areas.
-        """
-    )
+    st.markdown("**What you’re seeing:**  \n• OOP per service by remoteness area (Major Cities → Very Remote) over time.  \n• Latest-year comparison of remoteness areas.")
 
     df = apply_state_filter(filter_by_year(t9))
     try:
@@ -458,8 +519,7 @@ elif page == "Remoteness":
         ly = int(df["Year"].max())
         latest = df[df["Year"] == ly].groupby("Area", as_index=False)[col_val].mean().sort_values(col_val)
         st.subheader(f"Latest-year by remoteness — {ly}")
-        fig2 = px.bar(latest, x=col_val, y="Area", orientation="h",
-                      labels={col_val:"Cost ($)", "Area":"Remoteness"})
+        fig2 = px.bar(latest, x=col_val, y="Area", orientation="h", labels={col_val:"Cost ($)", "Area":"Remoteness"})
         fig2 = style_bar(fig2, "Latest-year remoteness")
         st.plotly_chart(fig2, use_container_width=True)
         st.caption("Bars show the mean OOP per GP service for each remoteness area in the latest year.")
@@ -467,21 +527,14 @@ elif page == "Remoteness":
 # ---------- States ----------
 elif page == "States & Territories":
     st.title("States & Territories")
-    st.markdown(
-        """
-**What you’re seeing:**  
-• Heatmap of OOP (Actual) by state/territory across years (darker = higher).  
-• Optional line comparison for selected states.
-        """
-    )
+    st.markdown("**What you’re seeing:**  \n• Heatmap of OOP (Actual) by state/territory across years (darker = higher).  \n• Optional line comparison for selected states.")
     df = filter_by_year(st_wide)
     if df.empty:
         st.info("No state data in current range.")
     else:
         pvt = df.pivot_table(index="Region", columns="Year", values="_actual_mean", aggfunc="mean")
         st.subheader("Heatmap (Actual)")
-        fig = px.imshow(pvt, aspect="auto", color_continuous_scale="YlOrRd",
-                        labels=dict(color="Cost ($)"))
+        fig = px.imshow(pvt, aspect="auto", color_continuous_scale="YlOrRd", labels=dict(color="Cost ($)"))
         fig = style_heatmap(fig, "OOP (mean of quintiles) by State/Territory × Year")
         st.plotly_chart(fig, use_container_width=True)
         st.caption("Cells show the mean OOP per GP service for each state × year (Actual prices).")
@@ -496,9 +549,62 @@ elif page == "States & Territories":
             st.plotly_chart(fig2, use_container_width=True)
             st.caption("Each dot is the yearly mean OOP per GP service for the selected state/territory.")
 
+# ---------- Predictions ----------
+elif page == "Predictions":
+    st.title("Predictions — National Forecast")
+    horizon = st.sidebar.slider("Forecast horizon (years)", min_value=5, max_value=40, value=20, step=1)
+    try:
+        fig, fcst_df, act_df = forecast_national(t8, basis, years=horizon)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # quick metrics
+        last_year  = int(act_df["Year"].max())
+        last_val   = float(act_df.loc[act_df["Year"] == last_year, "Value"].iloc[0])
+        next_year  = int(fcst_df["Year"].min()) if not fcst_df.empty else last_year + 1
+        next_val   = float(fcst_df.loc[fcst_df["Year"] == next_year, "Value"].iloc[0]) if not fcst_df.empty else last_val
+        final_year = int(fcst_df["Year"].max()) if not fcst_df.empty else last_year
+        final_val  = float(fcst_df.loc[fcst_df["Year"] == final_year, "Value"].iloc[0]) if not fcst_df.empty else last_val
+
+        n_years = fcst_df.shape[0]
+        cagr = ((final_val / last_val) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0.0
+        yoy = (next_val - last_val) / last_val * 100 if last_val else 0.0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Latest actual", f"${last_val:,.2f}", f"Year {last_year}")
+        c2.metric(f"Next year ({next_year}) forecast", f"${next_val:,.2f}", f"{yoy:+.1f}% vs {last_year}")
+        c3.metric(f"{n_years}-yr CAGR (forecast)", f"{cagr:.1f}%")
+
+        st.subheader("Forecast numbers")
+        if not fcst_df.empty:
+            st.dataframe(
+                fcst_df.rename(columns={"Value": "Forecast ($)", "Lower": "Lower (80%)", "Upper": "Upper (80%)"})
+                       .style.format({"Forecast ($)": "${:,.2f}", "Lower (80%)": "${:,.2f}", "Upper (80%)": "${:,.2f}"}),
+                use_container_width=True
+            )
+            st.download_button(
+                "Download forecast as CSV",
+                data=fcst_df.to_csv(index=False).encode(),
+                file_name="oop_forecast.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No future years requested/available for forecast table.")
+
+        st.markdown(
+            f"""
+**Notes on long-range forecasts**
+
+- You’re viewing a **{n_years}-year** projection. Uncertainty grows the further out we go.
+- When Prophet is available, intervals already widen with horizon.  
+- With the linear fallback, intervals also widen (roughly with √t) to reflect compounding uncertainty.
+- These are **trend extrapolations**—no policy, fee-setting, or macro shocks are modelled.
+"""
+        )
+    except Exception as e:
+        st.error(f"Could not generate forecast: {e}")
+
 # ---------- footer ----------
-st.caption("Notes: “Actual” = prices in the year paid. “Inflation adjusted” = constant dollars to compare across years. "
-           "Data sources: cleaned CSVs from AIHW MBS bulk-billing summary (Table 8 & 9), and state-wide file.")
-
-
-
+st.caption(
+    "Notes: “Actual” = prices in the year paid. “Inflation adjusted” = constant dollars to compare across years. "
+    "Data sources: cleaned CSVs from AIHW MBS bulk-billing summary (Table 8 & 9), and state-wide file."
+)
