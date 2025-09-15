@@ -8,10 +8,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import plotly.graph_objects as go
+
 # ---------- CONFIG ----------
 st.set_page_config(page_title="Out-of-Pocket Costs Dashboard", layout="wide")
 
-DATA_DIR = "data"
+DATA_DIR = "."
 
 FILE_TABLE8 = "Table8_GP_Out_of_Pocket_Clean_YearFixed (1).csv"
 FILE_TABLE9 = "Table9_Remoteness_Out_of_Pocket_Clean (1) (1).csv"
@@ -277,17 +279,11 @@ state_pick = st.sidebar.multiselect("State(s)/Territories", options=state_option
 page = st.sidebar.radio("Page", ["Overview", "SEIFA equity", "Remoteness", "States & Territories", "Predictions"])
 
 # ---------- forecasting ----------
-def forecast_national(df: pd.DataFrame, basis: str, years: int = 5):
-    """
-    Returns (fig, forecast_df, actual_df)
 
-    forecast_df: Year, Value, Lower, Upper  (future rows only)
-    actual_df:   Year, Value                (history used for the model)
-    """
-    # pick value column (Actual / Inflation adjusted)
+def forecast_national(df: pd.DataFrame, basis: str, years: int = 20):
     col_val = value_col_choice(df, basis)
 
-    # national mean per year (use Aus if available, else average states)
+    # national mean per year
     base = df.copy()
     aus = base[base["State"].astype(str).str.fullmatch("Aus", case=False, na=False)]
     if aus.empty:
@@ -296,42 +292,30 @@ def forecast_national(df: pd.DataFrame, basis: str, years: int = 5):
         series = aus.groupby("Year", as_index=False)[col_val].mean()
 
     series = series.dropna().sort_values("Year")
-    if series.empty:
-        raise ValueError("No national series available to forecast.")
-
     ts = series.rename(columns={"Year": "ds", col_val: "y"}).copy()
     ts["ds"] = pd.to_datetime(ts["ds"], format="%Y")
 
-    # --- try Prophet; fall back to linear regression
-    use_prophet = False
+    # --- Prophet if available, else linear fallback
     try:
-        from prophet import Prophet  # type: ignore
-        use_prophet = True
-    except Exception:
-        use_prophet = False
-
-    if use_prophet:
-        m = Prophet(interval_width=0.80, yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False)
+        from prophet import Prophet
+        m = Prophet(interval_width=0.8, yearly_seasonality=False)
         m.fit(ts)
         future = m.make_future_dataframe(periods=years, freq="Y")
         fc = m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-    else:
+    except Exception:
         from sklearn.linear_model import LinearRegression
-
         X = np.arange(len(ts)).reshape(-1, 1)
         y = ts["y"].values
         model = LinearRegression().fit(X, y)
-
         Xf = np.arange(len(ts) + years).reshape(-1, 1)
         yhat = model.predict(Xf)
 
         resid = y - model.predict(X)
-        s = float(np.std(resid)) if len(resid) else 0.0
-
+        s = np.std(resid)
+        z = 1.28  # ~80%
         h = np.arange(len(Xf)) - (len(ts) - 1)
         h = np.clip(h, 0, None)
         widen = np.sqrt(1 + h)
-        z = 1.28  # ~80%
 
         dates = pd.date_range(ts["ds"].min(), periods=len(ts) + years, freq="Y")
         fc = pd.DataFrame({
@@ -341,39 +325,61 @@ def forecast_national(df: pd.DataFrame, basis: str, years: int = 5):
             "yhat_upper": yhat + z * s * widen
         })
 
-    # Split history vs future
-    cutoff = ts["ds"].max()
-    act = ts.copy()
-    act["Year"] = act["ds"].dt.year
-    act = act.rename(columns={"y": "Value"})[["Year", "Value"]]
+    # ---- Build styled chart ----
+    act = fc[fc["ds"] <= ts["ds"].max()]
+    fut = fc[fc["ds"] > ts["ds"].max()]
 
-    pred = fc[fc["ds"] > cutoff].copy()
-    pred["Year"] = pred["ds"].dt.year
-    pred = pred.rename(columns={"yhat": "Value", "yhat_lower": "Lower", "yhat_upper": "Upper"})[
-        ["Year", "Value", "Lower", "Upper"]
-    ]
+    fig = go.Figure()
 
-    # Build figure
-    fig = px.line(act, x="Year", y="Value")
-    fig.update_traces(mode="lines", line=dict(width=3),
-                      hovertemplate="<b>%{x}</b><br>$%{y:.2f}<extra>Actual</extra>")
-    if not pred.empty:
-        fig.add_scatter(
-            x=pred["Year"], y=pred["Value"], mode="lines",
-            line=dict(width=3, dash="dash", color="#E45756"),
-            name="Forecast",
-            hovertemplate="<b>%{x}</b><br>$%{y:.2f}<extra>Forecast</extra>",
-        )
-        fig.add_scatter(
-            x=list(pred["Year"]) + list(pred["Year"][::-1]),
-            y=list(pred["Upper"]) + list(pred["Lower"][::-1]),
-            fill="toself", fillcolor="rgba(228,87,86,0.15)",
-            line=dict(width=0), hoverinfo="skip", name="80% interval"
-        )
-    fig = style_time_series(fig, f"National OOP forecast — {basis}",
-                            subtitle="Solid = actuals, dashed = forecast, band = ~80% interval")
+    # actual history
+    fig.add_trace(go.Scatter(
+        x=act["ds"].dt.year, y=act["yhat"],
+        mode="lines",
+        line=dict(color="#5DA5DA", width=2.5),
+        name="Actual"
+    ))
 
-    return fig, pred, act
+    # forecast line
+    fig.add_trace(go.Scatter(
+        x=fut["ds"].dt.year, y=fut["yhat"],
+        mode="lines",
+        line=dict(color="#F15854", width=2.5, dash="dash"),
+        name="Forecast"
+    ))
+
+    # confidence band
+    fig.add_trace(go.Scatter(
+        x=list(fut["ds"].dt.year) + list(fut["ds"].dt.year[::-1]),
+        y=list(fut["yhat_upper"]) + list(fut["yhat_lower"][::-1]),
+        fill="toself",
+        fillcolor="rgba(241, 88, 84, 0.2)",
+        line=dict(color="rgba(255,255,255,0)"),
+        hoverinfo="skip",
+        showlegend=True,
+        name="80% interval"
+    ))
+
+    fig.update_layout(
+        template=_template(),
+        title=f"National OOP forecast — {basis}",
+        title_x=0.02,
+        margin=dict(l=40, r=40, t=60, b=40),
+        yaxis=currency_axis(),
+        xaxis_title="Year",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="left", x=0.0, title=None)
+    )
+
+    # return for metrics
+    forecast_df = fut.rename(columns={"ds": "Year", "yhat": "Value",
+                                      "yhat_lower": "Lower", "yhat_upper": "Upper"})
+    forecast_df["Year"] = forecast_df["Year"].dt.year
+
+    actual_df = act.rename(columns={"ds": "Year", "yhat": "Value"})
+    actual_df["Year"] = actual_df["Year"].dt.year
+
+    return fig, forecast_df, actual_df
+
 
 # ---------- derive filtered frames ----------
 def filter_by_year(df):
@@ -608,4 +614,3 @@ st.caption(
     "Notes: “Actual” = prices in the year paid. “Inflation adjusted” = constant dollars to compare across years. "
     "Data sources: cleaned CSVs from AIHW MBS bulk-billing summary (Table 8 & 9), and state-wide file."
 )
-
